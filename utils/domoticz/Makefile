@@ -8,12 +8,15 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=domoticz
-PKG_VERSION:=2025.2
-PKG_RELEASE:=5
+PKG_VERSION:=2026.4
+PKG_RELEASE:=1
 
-PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
-PKG_SOURCE_URL:=https://codeload.github.com/domoticz/domoticz/tar.gz/$(PKG_VERSION)?
-PKG_HASH:=fd016f4ffe419e8d559bc0a7f9de5ec4fcaf485fc9d1464c8e8221102b13f589
+# The codeload tarball lacks the extern/ submodules (libwebem); use the
+# source asset from the release, which bundles them.
+PKG_SOURCE:=domoticz_src_2026.18387.tar.gz
+PKG_SOURCE_URL:=https://github.com/domoticz/domoticz/releases/download/$(PKG_VERSION)
+PKG_HASH:=88964b791050abf6b6df3ec9e1d262d18e198a6fa108638974eca8600d1a4568
+PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)
 
 PKG_MAINTAINER:=David Woodhouse <dwmw2@infradead.org>
 PKG_LICENSE:=GPL-3.0
@@ -55,8 +58,8 @@ define Package/domoticz/description
 endef
 
 CMAKE_OPTIONS += \
-	-DBUILD_SHARED_LIBS=yes \
 	-DBoost_NO_BOOST_CMAKE=yes \
+	-DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY \
 	-DGIT_SUBMODULE=no \
 	-DCMAKE_BUILD_TYPE=Release \
 	-DUSE_BUILTIN_MQTT=no \
