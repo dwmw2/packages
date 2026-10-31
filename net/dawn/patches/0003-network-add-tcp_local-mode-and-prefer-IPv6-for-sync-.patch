@@ -1,0 +1,483 @@
+From 71a12d8f109a8a5aa1601d491045c3d435b65fb9 Mon Sep 17 00:00:00 2001
+From: David Woodhouse <dwmw@amazon.co.uk>
+Date: Fri, 30 Oct 2026 21:45:58 +0000
+Subject: [PATCH 3/4] network: add tcp_local mode, and prefer IPv6 for sync
+ connections
+
+Order the addresses which umdns advertises for a peer in the usual
+getaddrinfo() style - link-local IPv6 first, then global IPv6, then
+Legacy IP - and connect to the most preferred, falling back down the
+list when a connection fails. Link-local is renumbering-proof, and a
+peer which cannot accept it (an older dawn only listens on Legacy IP)
+is still reached through the fallback.
+
+With the new option tcp_local set, additionally reject inbound sync
+connections from any address which is neither link-local nor a unicast
+address within a prefix directly attached to a local interface. The
+sync protocol trusts whoever can connect: without use_symm_enc the
+message content is unauthenticated, and even with it, the framing is
+parsed pre-auth. An off-link attacker can spoof an on-link source
+address but can never complete a TCP handshake with one, since the
+return path leads back to the local link.
+
+Peers discovered via umdns are on-link by definition, so with
+network_option 2 the restriction costs nothing, and old and new dawn
+instances interoperate in both directions. Deployments with a routed
+server_ip hub must leave tcp_local unset on the hub, as it cannot
+enumerate its spokes.
+
+The umdns browse results carry multiple "ipv6" members for a host with
+more than one address, which a one-shot blobmsg_parse() policy cannot
+see; walk the attributes by hand.
+
+Signed-off-by: David Woodhouse <dwmw@amazon.co.uk>
+---
+ src/include/datastorage.h |   1 +
+ src/include/tcpsocket.h   |  17 ++++
+ src/network/tcpsocket.c   | 179 ++++++++++++++++++++++++++++++++------
+ src/utils/dawn_uci.c      |   3 +
+ src/utils/ubus.c          |  78 +++++++++++++----
+ 5 files changed, 233 insertions(+), 45 deletions(-)
+
+diff --git a/src/include/datastorage.h b/src/include/datastorage.h
+index a20d7ad..9377624 100644
+--- a/src/include/datastorage.h
++++ b/src/include/datastorage.h
+@@ -126,6 +126,7 @@ struct network_config_s {
+     char server_ip[MAX_IP_LENGTH + 1];
+     char tcp_ip[MAX_IP_LENGTH + 1];
+     int tcp_port;
++    int tcp_local; // restrict TCP sync to the local network
+     int network_option; // 0:Broadcast; 1:Multicast; 2:TCP+UMDNS; 3:TCP
+     char shared_key[MAX_KEY_LENGTH + 1];
+     char iv[MAX_KEY_LENGTH + 1];
+diff --git a/src/include/tcpsocket.h b/src/include/tcpsocket.h
+index d567668..5072bd3 100644
+--- a/src/include/tcpsocket.h
++++ b/src/include/tcpsocket.h
+@@ -3,6 +3,11 @@
+ 
+ #include <libubox/ustream.h>
+ #include <netinet/in.h>
++#include <net/if.h>
++
++/* room for an address plus %interface scope suffix */
++#define DAWN_CON_ADDR_LEN (INET6_ADDRSTRLEN + IF_NAMESIZE + 2)
++#define DAWN_CON_MAX_ADDRS 3
+ 
+ #define ARRAY_NETWORK_LEN 50
+ #define CHECK_TIMEOUT 10
+@@ -15,6 +20,12 @@ struct network_con_s {
+     struct sockaddr_storage sock_addr;
+     int connected;
+     time_t time_alive;
++
++    /* candidate addresses for this peer, most preferred first */
++    char addrs[DAWN_CON_MAX_ADDRS][DAWN_CON_ADDR_LEN];
++    int naddrs;
++    int cur_addr;
++    int port;
+ };
+ 
+ /**
+@@ -25,6 +36,12 @@ struct network_con_s {
+  */
+ int add_tcp_connection(char *ipv4, int port);
+ 
++/**
++ * Add tcp connection with a list of candidate addresses for the peer,
++ * most preferred first. Falls back down the list on connection failure.
++ */
++int add_tcp_connection_list(char (*addrs)[DAWN_CON_ADDR_LEN], int naddrs, int port);
++
+ /**
+  * Opens a tcp server and adds it to the uloop.
+  * @param port
+diff --git a/src/network/tcpsocket.c b/src/network/tcpsocket.c
+index 732681c..9aeb4ab 100644
+--- a/src/network/tcpsocket.c
++++ b/src/network/tcpsocket.c
+@@ -2,6 +2,7 @@
+ #include <arpa/inet.h>
+ #include <inttypes.h>
+ #include <netdb.h>
++#include <ifaddrs.h>
+ 
+ #include "memory_utils.h"
+ #include "msghandler.h"
+@@ -23,6 +24,7 @@ LIST_HEAD(tcp_sock_list);
+ LIST_HEAD(cli_list);
+ 
+ struct network_con_s *tcp_list_contains_address(const struct sockaddr_storage *entry);
++static int con_dial(struct network_con_s *con);
+ 
+ /* Render an address (either family) and extract the port, for logging */
+ static const char *addr_to_str(const struct sockaddr_storage *ss, char *buf,
+@@ -246,6 +248,63 @@ process_done:
+     return;
+ }
+ 
++/* Is the peer link-local, or a unicast address within a prefix which is
++ * directly attached to a local interface? An off-link attacker can spoof
++ * such a source address but can never complete a TCP handshake with it,
++ * because the return path leads back to the local link. */
++static int peer_is_local(const struct sockaddr_storage *peer) {
++    struct in_addr a4 = { 0 };
++    const struct in6_addr *a6 = NULL;
++    struct ifaddrs *ifa0, *ifa;
++    int ok = 0;
++
++    if (peer->ss_family == AF_INET6) {
++        const struct sockaddr_in6 *p6 = (const struct sockaddr_in6 *)peer;
++
++        if (IN6_IS_ADDR_LINKLOCAL(&p6->sin6_addr))
++            return 1;
++        if (IN6_IS_ADDR_V4MAPPED(&p6->sin6_addr))
++            memcpy(&a4, &p6->sin6_addr.s6_addr[12], 4);
++        else
++            a6 = &p6->sin6_addr;
++    } else if (peer->ss_family == AF_INET) {
++        a4 = ((const struct sockaddr_in *)peer)->sin_addr;
++    } else {
++        return 0;
++    }
++
++    if (getifaddrs(&ifa0) < 0)
++        return 0;
++
++    for (ifa = ifa0; ifa && !ok; ifa = ifa->ifa_next) {
++        if (!ifa->ifa_addr || !ifa->ifa_netmask)
++            continue;
++
++        if (!a6 && ifa->ifa_addr->sa_family == AF_INET) {
++            struct sockaddr_in *ia = (struct sockaddr_in *)ifa->ifa_addr;
++            struct sockaddr_in *im = (struct sockaddr_in *)ifa->ifa_netmask;
++
++            if ((a4.s_addr & im->sin_addr.s_addr) ==
++                (ia->sin_addr.s_addr & im->sin_addr.s_addr))
++                ok = 1;
++        } else if (a6 && ifa->ifa_addr->sa_family == AF_INET6) {
++            struct sockaddr_in6 *ia = (struct sockaddr_in6 *)ifa->ifa_addr;
++            struct sockaddr_in6 *im = (struct sockaddr_in6 *)ifa->ifa_netmask;
++            int i;
++
++            for (i = 0; i < 16; i++) {
++                if ((a6->s6_addr[i] & im->sin6_addr.s6_addr[i]) !=
++                    (ia->sin6_addr.s6_addr[i] & im->sin6_addr.s6_addr[i]))
++                    break;
++            }
++            if (i == 16)
++                ok = 1;
++        }
++    }
++    freeifaddrs(ifa0);
++    return ok;
++}
++
+ static void server_cb(struct uloop_fd *fd, unsigned int events) {
+     struct client *cl; //MUSTDO: check free() of this
+     unsigned int sl = sizeof(struct sockaddr_storage);
+@@ -264,6 +323,15 @@ static void server_cb(struct uloop_fd *fd, unsigned int events) {
+         return;
+     }
+ 
++    if (network_config.tcp_local && !peer_is_local(&cl->sin)) {
++        char abuf[INET6_ADDRSTRLEN];
++
++        addr_to_str(&cl->sin, abuf, sizeof(abuf), NULL);
++        dawnlog_warning("Rejecting non-local connection from %s\n", abuf);
++        close(sfd);
++        return;
++    }
++
+     cl->s.stream.string_data = 1;
+     cl->s.stream.notify_read = client_read_cb;
+     cl->s.stream.notify_state = client_notify_state;
+@@ -281,6 +349,12 @@ int run_server(char *ipv4, int port) {
+     char port_str[12];
+     sprintf(port_str, "%d", port); // TODO: Manage buffer length
+ 
++    /* To accept IPv6 peers, listen on the v6 wildcard (dual-stack)
++     * instead of the Legacy IP default, unless the user configured
++     * something explicit. */
++    if (network_config.tcp_local && !strcmp(ipv4, "0.0.0.0"))
++        ipv4 = "::";
++
+     server.cb = server_cb;
+     server.fd = usock(USOCK_TCP | USOCK_SERVER | USOCK_NUMERIC, ipv4, port_str);
+     if (server.fd < 0) {
+@@ -349,8 +423,16 @@ static void connect_cb(struct uloop_fd *f, unsigned int events) {
+     dawnlog_debug_func("Entering...");
+ 
+     if (f->eof || f->error) {
+-        dawnlog_error("Connection failed (%s)\n", f->eof ? "EOF" : "ERROR");
++        uloop_fd_delete(&entry->fd);
+         close(entry->fd.fd);
++        while (++entry->cur_addr < entry->naddrs) {
++            dawnlog_warning("Connection to %s:%d failed, trying %s\n",
++                            entry->addrs[entry->cur_addr - 1], entry->port,
++                            entry->addrs[entry->cur_addr]);
++            if (con_dial(entry) == 0)
++                return;
++        }
++        dawnlog_error("Connection failed (%s)\n", f->eof ? "EOF" : "ERROR");
+         list_del(&entry->list);
+         dawn_free(entry);
+         entry = NULL;
+@@ -369,35 +451,67 @@ static void connect_cb(struct uloop_fd *f, unsigned int events) {
+     entry->connected = 1;
+ }
+ 
+-int add_tcp_connection(char *ipv4, int port) {
++/* Dial the current candidate address of a connection entry. Returns 0
++ * if a connection attempt is in flight, -1 if the address was unusable. */
++static int con_dial(struct network_con_s *con) {
+     struct addrinfo hints = {
+         .ai_family = AF_UNSPEC,
+         .ai_socktype = SOCK_STREAM,
+         .ai_flags = AI_NUMERICHOST | AI_NUMERICSERV,
+     };
+     struct addrinfo *res = NULL;
+-    struct sockaddr_storage serv_addr;
+-
+-    dawnlog_debug_func("Entering...");
+-
++    char *addr = con->addrs[con->cur_addr];
+     char port_str[12];
+-    sprintf(port_str, "%d", port); // TODO: Manage buffer length
+ 
+-    if (getaddrinfo(ipv4, port_str, &hints, &res) || !res) {
+-        dawnlog_error("Failed to parse peer address %s\n", ipv4);
++    sprintf(port_str, "%d", con->port); // TODO: Manage buffer length
++
++    if (getaddrinfo(addr, port_str, &hints, &res) || !res) {
++        dawnlog_error("Failed to parse peer address %s\n", addr);
+         return -1;
+     }
+ 
+-    memset(&serv_addr, 0, sizeof(serv_addr));
+-    memcpy(&serv_addr, res->ai_addr, res->ai_addrlen);
++    memset(&con->sock_addr, 0, sizeof(con->sock_addr));
++    memcpy(&con->sock_addr, res->ai_addr, res->ai_addrlen);
+     freeaddrinfo(res);
+ 
+-    struct network_con_s *tmp = tcp_list_contains_address(&serv_addr);
++    con->fd.fd = usock(USOCK_TCP | USOCK_NONBLOCK, addr, port_str);
++    if (con->fd.fd < 0)
++        return -1;
++
++    con->fd.cb = connect_cb;
++    uloop_fd_add(&con->fd, ULOOP_WRITE | ULOOP_EDGE_TRIGGER);
++
++    dawnlog_warning("New TCP connection to %s:%d\n", addr, con->port);
++    con->time_alive = time(0);
++    return 0;
++}
++
++int add_tcp_connection_list(char (*addrs)[DAWN_CON_ADDR_LEN], int naddrs, int port) {
++    struct network_con_s *con, *tmp = NULL;
++    int i, j;
++
++    dawnlog_debug_func("Entering...");
++
++    if (naddrs < 1)
++        return -1;
++    if (naddrs > DAWN_CON_MAX_ADDRS)
++        naddrs = DAWN_CON_MAX_ADDRS;
++
++    /* An entry for this peer may exist under any of its addresses */
++    list_for_each_entry(con, &tcp_sock_list, list) {
++        for (i = 0; i < naddrs && !tmp; i++)
++            for (j = 0; j < con->naddrs && !tmp; j++)
++                if (con->port == port && !strcmp(con->addrs[j], addrs[i]))
++                    tmp = con;
++        if (tmp)
++            break;
++    }
++
+     if (tmp != NULL) {
+-        if(tmp->connected == true)
++        if (tmp->connected == true)
+         {
+             return 0;
+-        } else{
++        } else {
+             // Delete already existing entry
+             close(tmp->fd.fd);
+             list_del(&tmp->list);
+@@ -407,22 +521,35 @@ int add_tcp_connection(char *ipv4, int port) {
+     }
+ 
+     struct network_con_s *tcp_entry = dawn_calloc(1, sizeof(struct network_con_s));
+-    tcp_entry->fd.fd = usock(USOCK_TCP | USOCK_NONBLOCK, ipv4, port_str);
+-    tcp_entry->sock_addr = serv_addr;
+-
+-    if (tcp_entry->fd.fd < 0) {
+-        dawn_free(tcp_entry);
+-        tcp_entry = NULL;
++    if (!tcp_entry)
+         return -1;
++
++    tcp_entry->port = port;
++    tcp_entry->naddrs = naddrs;
++    for (i = 0; i < naddrs; i++) {
++        strncpy(tcp_entry->addrs[i], addrs[i], DAWN_CON_ADDR_LEN - 1);
++        tcp_entry->addrs[i][DAWN_CON_ADDR_LEN - 1] = 0;
++    }
++
++    while (tcp_entry->cur_addr < tcp_entry->naddrs) {
++        if (con_dial(tcp_entry) == 0) {
++            list_add(&tcp_entry->list, &tcp_sock_list);
++            return 0;
++        }
++        tcp_entry->cur_addr++;
+     }
+-    tcp_entry->fd.cb = connect_cb;
+-    uloop_fd_add(&tcp_entry->fd, ULOOP_WRITE | ULOOP_EDGE_TRIGGER);
+ 
+-    dawnlog_warning("New TCP connection to %s:%d\n", ipv4, port);
+-    tcp_entry->time_alive = time(0);
+-    list_add(&tcp_entry->list, &tcp_sock_list);
++    dawn_free(tcp_entry);
++    return -1;
++}
+ 
+-    return 0;
++int add_tcp_connection(char *ipv4, int port) {
++    char addrs[1][DAWN_CON_ADDR_LEN];
++
++    strncpy(addrs[0], ipv4, DAWN_CON_ADDR_LEN - 1);
++    addrs[0][DAWN_CON_ADDR_LEN - 1] = 0;
++
++    return add_tcp_connection_list(addrs, 1, port);
+ }
+ 
+ void send_tcp(char *msg) {
+diff --git a/src/utils/dawn_uci.c b/src/utils/dawn_uci.c
+index 55130e3..246ea88 100644
+--- a/src/utils/dawn_uci.c
++++ b/src/utils/dawn_uci.c
+@@ -384,6 +384,7 @@ struct network_config_s uci_get_dawn_network() {
+         .server_ip = "",
+         .tcp_ip = "0.0.0.0",
+         .tcp_port = 1026,
++        .tcp_local = 0,
+         .network_option = 2,
+         .shared_key = "Niiiiiiiiiiiiiik",
+         .iv = "Niiiiiiiiiiiiiik",
+@@ -431,6 +432,8 @@ struct network_config_s uci_get_dawn_network() {
+                 strncpy(ret.tcp_ip, str_tcp_ip, MAX_IP_LENGTH);
+             // CONFIG-N: tcp_port|Port for TCP networking|[1025]
+             DAWN_SET_CONFIG_INT(ret, s, tcp_port);
++            // CONFIG-N: tcp_local|Restrict TCP networking to the local network|[0 = Disabled]; 1 = Enabled
++            DAWN_SET_CONFIG_INT(ret, s, tcp_local);
+             // CONFIG-N: use_symm_enc|Enable encryption of network traffic|[0 = Disabled]; 1 = Enabled
+             DAWN_SET_CONFIG_INT(ret, s, use_symm_enc);
+             // CONFIG-N: collision_domain|Unused|N/A
+diff --git a/src/utils/ubus.c b/src/utils/ubus.c
+index 63e6cd2..93bbc2f 100644
+--- a/src/utils/ubus.c
++++ b/src/utils/ubus.c
+@@ -1,5 +1,8 @@
+ #include <dirent.h>
+ #include <libubus.h>
++#include <arpa/inet.h>
++#include <net/if.h>
++#include <netinet/in.h>
+ 
+ #include "memory_utils.h"
+ #include "networksocket.h"
+@@ -168,17 +171,6 @@ static const struct blobmsg_policy dawn_umdns_table_policy[__DAWN_UMDNS_TABLE_MA
+         [DAWN_UMDNS_TABLE] = {.name = "_dawn._tcp", .type = BLOBMSG_TYPE_TABLE},
+ };
+ 
+-enum {
+-    DAWN_UMDNS_IPV4,
+-    DAWN_UMDNS_PORT,
+-    __DAWN_UMDNS_MAX,
+-};
+-
+-static const struct blobmsg_policy dawn_umdns_policy[__DAWN_UMDNS_MAX] = {
+-        [DAWN_UMDNS_IPV4] = {.name = "ipv4", .type = BLOBMSG_TYPE_STRING},
+-        [DAWN_UMDNS_PORT] = {.name = "port", .type = BLOBMSG_TYPE_INT32},
+-};
+-
+ enum {
+     RRM_ARRAY,
+     __RRM_MAX,
+@@ -1368,16 +1360,64 @@ static void ubus_umdns_cb(struct ubus_request *req, int type, struct blob_attr *
+         dawnlog_debug("Hostname: %s\n", hdr->name);
+ #endif
+ 
+-        struct blob_attr *tb_dawn[__DAWN_UMDNS_MAX];
+-        blobmsg_parse(dawn_umdns_policy, __DAWN_UMDNS_MAX, tb_dawn, blobmsg_data(attr), blobmsg_len(attr));
++        /* umdns emits multiple "ipv6" members for a host with more than
++         * one address, so a one-shot blobmsg_parse() policy cannot see
++         * them all.  Walk the attributes by hand. */
++        struct blob_attr *cur;
++        int rem = blobmsg_len(attr);
++        const char *ipv4 = NULL, *ll6 = NULL, *gua6 = NULL, *iface = NULL;
++        uint32_t port = 0;
++        bool has_port = false;
+ 
+-        if (tb_dawn[DAWN_UMDNS_IPV4] && tb_dawn[DAWN_UMDNS_PORT]) {
+-            dawnlog_debug("IPV4: %s\n", blobmsg_get_string(tb_dawn[DAWN_UMDNS_IPV4]));
+-            dawnlog_debug("Port: %d\n", blobmsg_get_u32(tb_dawn[DAWN_UMDNS_PORT]));
+-        } else {
+-            return; // TODO: We're in a loop. Should this be return or continue?
++        __blob_for_each_attr(cur, blobmsg_data(attr), rem)
++        {
++            const char *name = blobmsg_name(cur);
++
++            if (blobmsg_type(cur) == BLOBMSG_TYPE_STRING && !strcmp(name, "ipv4")) {
++                ipv4 = blobmsg_get_string(cur);
++            } else if (blobmsg_type(cur) == BLOBMSG_TYPE_STRING && !strcmp(name, "iface")) {
++                iface = blobmsg_get_string(cur);
++            } else if (blobmsg_type(cur) == BLOBMSG_TYPE_INT32 && !strcmp(name, "port")) {
++                port = blobmsg_get_u32(cur);
++                has_port = true;
++            } else if (blobmsg_type(cur) == BLOBMSG_TYPE_STRING && !strcmp(name, "ipv6")) {
++                struct in6_addr a6;
++                const char *v = blobmsg_get_string(cur);
++
++                if (inet_pton(AF_INET6, v, &a6) != 1)
++                    continue;
++                if (IN6_IS_ADDR_LINKLOCAL(&a6)) {
++                    if (!ll6)
++                        ll6 = v;
++                } else if (!gua6) {
++                    gua6 = v;
++                }
++            }
++        }
++
++        if (!has_port)
++            continue;
++
++        /* Candidates in getaddrinfo() style order of preference:
++         * link-local IPv6 (renumbering-proof), global IPv6, Legacy IP.
++         * A peer which cannot accept the preferred address is reached
++         * through connect-time fallback down the list. */
++        char cand[DAWN_CON_MAX_ADDRS][DAWN_CON_ADDR_LEN];
++        int ncand = 0;
++
++        if (ll6 && iface)
++            snprintf(cand[ncand++], DAWN_CON_ADDR_LEN, "%s%%%s", ll6, iface);
++        if (gua6)
++            snprintf(cand[ncand++], DAWN_CON_ADDR_LEN, "%s", gua6);
++        if (ipv4)
++            snprintf(cand[ncand++], DAWN_CON_ADDR_LEN, "%s", ipv4);
++
++        if (ncand) {
++            dawnlog_debug("peer candidates: %s%s%s%s%s port %u\n",
++                          cand[0], ncand > 1 ? ", " : "", ncand > 1 ? cand[1] : "",
++                          ncand > 2 ? ", " : "", ncand > 2 ? cand[2] : "", port);
++            add_tcp_connection_list(cand, ncand, port);
+         }
+-        add_tcp_connection(blobmsg_get_string(tb_dawn[DAWN_UMDNS_IPV4]), blobmsg_get_u32(tb_dawn[DAWN_UMDNS_PORT]));
+     }
+ }
+ 
+-- 
+2.43.0
+

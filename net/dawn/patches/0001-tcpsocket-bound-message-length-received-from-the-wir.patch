@@ -1,0 +1,48 @@
+From d3084bf4623a0683271b3b3af6ec313f0d9a8413 Mon Sep 17 00:00:00 2001
+From: David Woodhouse <dwmw@amazon.co.uk>
+Date: Fri, 30 Oct 2026 21:42:14 +0000
+Subject: [PATCH 1/4] tcpsocket: bound message length received from the wire
+
+The first four bytes of each message on the sync socket are a length,
+which is passed directly to dawn_realloc() without any sanity check.
+Anything which connects and sends text makes dawn attempt a huge
+allocation: an HTTP "GET " comes out as a 1.14GiB request. Allocation
+sizes up to 4GiB can be demanded by anything which can connect, before
+any authentication.
+
+Reject lengths which do not even cover the header, and anything over
+1MiB, and close the offending connection.
+
+Signed-off-by: David Woodhouse <dwmw@amazon.co.uk>
+---
+ src/network/tcpsocket.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/network/tcpsocket.c b/src/network/tcpsocket.c
+index 4aa8a7c..1e80b2c 100644
+--- a/src/network/tcpsocket.c
++++ b/src/network/tcpsocket.c
+@@ -12,6 +12,7 @@
+ #define STR_QUOTE(x) STR_EVAL(x)
+ 
+ #define HEADER_SIZE sizeof(uint32_t)
++#define MAX_MSG_LEN (1024 * 1024)
+ #define PING_STR "ping"
+ #define PONG_STR "pong"
+ #define PING_SIZE (strlen(PING_STR)+1)
+@@ -139,6 +140,12 @@ static void client_read_cb(struct ustream *s, int bytes) {
+             cl->curr_len += HEADER_SIZE;
+             cl->final_len = ntohl(*(uint32_t *)cl->str);
+ 
++            if (cl->final_len <= HEADER_SIZE || cl->final_len > MAX_MSG_LEN) {
++                dawnlog_error("implausible message length %" PRIu32 ", closing connection\n", cl->final_len);
++                client_close(s);
++                return;
++            }
++
+             // On failure, dawn_realloc returns a null pointer. The original pointer str
+             // remains valid and may need to be deallocated.
+             char *str_tmp = dawn_realloc(cl->str, cl->final_len);
+-- 
+2.43.0
+
